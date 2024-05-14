@@ -1,0 +1,61 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+
+
+.program dataout
+    pull block    ; Load a 32-bit word from the TX FIFO into the OSR, stall if FIFO empty
+    out pins, 8   ; Turn LED on
+.wrap
+
+
+.program readdata
+
+start:
+    mov osr, null  ; clear OSR
+    out pindirs, 8 ; weakly pull up / disable output
+
+idle:
+; Wait for CS to assert low
+    wait 0 GPIO 16
+    ;in null, 31 ; push 30 zeroes to ISR
+    ;in pins, 1 ; read 1 bit from pins to ISR
+    ;mov x, isr ; read ISR into x
+    ;;jmp x-- idle ; jmp to idle if x is not zero
+    jmp pin idle ; jmp to idle if rd is not zero
+
+    mov osr, ~null ; set OSR to all ones
+    out pindirs, 8 ; set data pins as output
+
+readstall:
+; Wait for OE and CE to be high
+    jmp pin start ; jmp to start if rd is not zero
+    in pins, 15 ; read 1 bit from pins to ISR
+    in null, 31 ; push 31 zeroes to ISR
+    mov x, isr ; read ISR into x
+    jmp !x readstall ; jmp to readstall if x(cs) is zero
+.wrap
+
+
+.program writedata
+
+start:
+; Wait for CS to assert low
+
+    wait 0 GPIO 16
+    jmp pin start ; jmp to start if wr is not zero
+    in pins, 8 ; read 8 bits from pins to ISR
+    in null, 24 ; push 24 zeroes to ISR
+    push noblock ; push the 8-bit word onto the RX FIFO
+
+writestall:
+    jmp pin start ; jmp to start if wr is not zero
+    in pins, 15 ; read 15 bits from pins to ISR
+    in null, 31 ; push 31 zeroes to ISR
+    mov x, isr ; read ISR into x
+    jmp !x writestall ; jmp to writestall if x(cs) is zero
+
+    ; wrap to beginning of program
