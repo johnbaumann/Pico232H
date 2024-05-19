@@ -4,77 +4,73 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 ;
 
+.define GPIO_CS 10
+.define GPIO_ADDR 11
+.define GPIO_RD 12
+.define GPIO_WR 13
 
-
-; Monitor the RD signal and push data onto the TX FIFO when it is low
+; Monitor the RD signal
 .program readdata
+
+.define PIO_BASE 2
+.define PIO_CS GPIO_CS - PIO_BASE + 1
+.define PIO_ADDR GPIO_ADDR - PIO_BASE + 1
+.define PIO_RD GPIO_RD - PIO_BASE + 1
+.define PIO_WR GPIO_WR - PIO_BASE + 1
+
 start:
-    mov osr, null  ; clear OSR
-    out pindirs, 8 ; weakly pull up / disable output
+    mov osr, null       ; clear OSR
+    out pindirs, 8      ; weakly pull up / disable output
 
 idle:
-    wait 0 GPIO 10 ; wait for CS to assert low
-    jmp pin idle   ; jmp to idle if rd not asserted
+    wait 0 GPIO GPIO_CS ; wait for CS to assert low
+    jmp pin idle        ; jmp to idle if rd not asserted
 
 ; Pull data from FIFO, mask address pin, shift by 8 bits if addr > 1, output data
-    pull noblock    ; Load a 32-bit word from the RX FIFO into the OSR, stall if FIFO empty
-    mov y, osr  ; Copy OSR to y
-    in pins, 10
-    in null, 31
-    mov x, isr
-    push noblock   ; push address pin onto the TX FIFO
-    jmp !x pushdata
+    in pins, PIO_ADDR   ; Read pins up to Address bit
+    in null, 31         ; Shift out the other bits
+    mov x, isr          ; Copy ISR to x so we can branch on address pin
+    push noblock        ; push address pin onto the TX FIFO for upstream
+    pull noblock        ; Load a 32-bit word from the RX FIFO into the OSR
+    jmp !x pushdata     ; Address pin is low, don't shift(send data not status)
 
     ; Address pin is high, shift ISR right by 8 bits
-    mov isr, y
-    in null, 8
-    mov y, isr
+    out null, 8
 
 pushdata:
-    mov osr, y  ; Copy ISR to OSR
-    ;jmp x > 1, shift ; Jump to shift if address pin is greater than 1
-    out pins, 8   ; Output the lower 8 bits of the OSR to the data pins
+    out pins, 8         ; Output the lower 8 bits of the OSR to the data pins
 
 ; Toggle data pins as outputs, notify the upstream device that a byte was read
-    mov osr, ~null ; set OSR to all ones
-    out pindirs, 8 ; set data pins as output
+    mov osr, ~null      ; set OSR to all ones
+    out pindirs, 8      ; set data pins as output
 
 readstall:
 ; Wait for OE and CE to be high
-    jmp pin start ; jmp to start if rd is not zero
-    in pins, 9 ; read 15 bits from pins to ISR
-    in null, 31 ; push 31 zeroes to ISR, keep only the bit for CS
-    mov x, isr ; read ISR into x
-    jmp !x readstall ; jmp to readstall if x(CS) is zero
+    jmp pin start       ; jmp to start if rd is not zero
+    in pins, PIO_CS     ; read 9 bits from pins to ISR
+    in null, 31         ; push 31 zeroes to ISR, keep only the bit for CS
+    mov x, isr          ; read ISR into x
+    jmp !x readstall    ; jmp to readstall if x(CS) is zero
 .wrap
 
 
 ; Monitor the WR signal and push data onto the TX FIFO when it is low
 .program writedata
+
+.define PIO_BASE 2
+.define PIO_CS GPIO_CS - PIO_BASE + 1
+
 start:
-    wait 0 GPIO 10 ; Wait for CS to assert low
-    jmp pin start ; jmp to start if wr is not zero
-    in pins, 8 ; read 8 bits from pins to ISR
-    in null, 24 ; push 24 zeroes to ISR
-    push noblock ; push the 8-bit word onto the TX FIFO
+    wait 0 GPIO GPIO_CS ; Wait for CS to assert low
+    jmp pin start       ; jmp to start if wr is not zero
+    in pins, 8          ; read 8 bits from pins to ISR
+    in null, 24         ; push 24 zeroes to ISR
+    push noblock        ; push the 8-bit word onto the TX FIFO
 
 writestall:
-    jmp pin start ; jmp to start if wr is not zero
-    in pins, 9 ; read 15 bits from pins to ISR
-    in null, 31 ; push 31 zeroes to ISR
-    mov x, isr ; read ISR into x
-    jmp !x writestall ; jmp to writestall if x(cs) is zero
+    jmp pin start       ; jmp to start if wr is not zero
+    in pins, PIO_CS     ; read up to CS from pins to ISR
+    in null, 31         ; Shift all but CS bits out
+    mov x, isr          ; read ISR into x
+    jmp !x writestall   ; jmp to writestall if x(cs) is zero
 .wrap
-
-/*
-.program dataout
-    pull block    ; Load a 32-bit word from the RX FIFO into the OSR, stall if FIFO empty
-    ; if addr pin is high, shift isr right by 8 bits to output status
-    mov isr, osr
-    in null, 8
-    mov osr, isr
-    ; if addr pin is high, shift isr right by 8 bits
-    in null, 8
-    out pins, 8   ; Output the lower 8 bits of the OSR to the data pins
-.wrap
-*/

@@ -16,6 +16,8 @@
 #define FT_STATUS_SUSPEND 0x04         // SUSP
 #define FT_STATUS_CONFIGURED 0x08      // CONFIG
 
+#define STAT_DATASENT (1U << 8U)
+
 void init_cpu_fifo();
 void core1_main();
 
@@ -157,6 +159,7 @@ void init_cpu_fifo()
     sm_config_set_out_pins(&c_readdata, base_data_pin, 8);
     sm_config_set_jmp_pin(&c_readdata, rd_pin);
     sm_config_set_in_shift(&c_readdata, true, false, 32);
+    sm_config_set_out_shift(&c_readdata, true, true, 32);
 
     pio_sm_init(pio_cpufifo, sm_readdata, offset_readdata, &c_readdata);
     pio_sm_set_enabled(pio_cpufifo, sm_readdata, true);
@@ -208,14 +211,14 @@ void init_cpu_fifo()
         {
             printf("Byte read from: %x\n", pio_cpufifo->rxf[sm_readdata]);
             //pio_cpufifo->txf[sm_dataout] = datastatus_reg.value;
-            pio_cpufifo->txf[sm_readdata] = datastatus_reg.value;
         }
 
-        if (!fifo_empty())
+        if (!fifo_empty() && pio_sm_is_tx_fifo_full(pio_cpufifo, sm_readdata) == false) // TX
         {
             datastatus_reg.data = fifo_pop();
             update_fifo_flag();
             printf("Sending: %x\n", datastatus_reg.value);
+            pio_cpufifo->txf[sm_readdata] = datastatus_reg.value;
         }
 
         // TX
