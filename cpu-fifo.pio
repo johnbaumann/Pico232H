@@ -6,56 +6,75 @@
 
 
 
-.program dataout
-    pull block    ; Load a 32-bit word from the TX FIFO into the OSR, stall if FIFO empty
-    out pins, 8   ; Turn LED on
-.wrap
-
-
+; Monitor the RD signal and push data onto the TX FIFO when it is low
 .program readdata
-
 start:
     mov osr, null  ; clear OSR
     out pindirs, 8 ; weakly pull up / disable output
 
 idle:
-; Wait for CS to assert low
-    wait 0 GPIO 16
-    ;in null, 31 ; push 30 zeroes to ISR
-    ;in pins, 1 ; read 1 bit from pins to ISR
-    ;mov x, isr ; read ISR into x
-    ;;jmp x-- idle ; jmp to idle if x is not zero
-    jmp pin idle ; jmp to idle if rd is not zero
+    wait 0 GPIO 10 ; wait for CS to assert low
+    jmp pin idle   ; jmp to idle if rd not asserted
 
+; Pull data from FIFO, mask address pin, shift by 8 bits if addr > 1, output data
+    pull noblock    ; Load a 32-bit word from the RX FIFO into the OSR, stall if FIFO empty
+    mov y, osr  ; Copy OSR to y
+    in pins, 10
+    in null, 31
+    mov x, isr
+    push noblock   ; push address pin onto the TX FIFO
+    jmp !x pushdata
+
+    ; Address pin is high, shift ISR right by 8 bits
+    mov isr, y
+    in null, 8
+    mov y, isr
+
+pushdata:
+    mov osr, y  ; Copy ISR to OSR
+    ;jmp x > 1, shift ; Jump to shift if address pin is greater than 1
+    out pins, 8   ; Output the lower 8 bits of the OSR to the data pins
+
+; Toggle data pins as outputs, notify the upstream device that a byte was read
     mov osr, ~null ; set OSR to all ones
     out pindirs, 8 ; set data pins as output
 
 readstall:
 ; Wait for OE and CE to be high
     jmp pin start ; jmp to start if rd is not zero
-    in pins, 15 ; read 1 bit from pins to ISR
-    in null, 31 ; push 31 zeroes to ISR
+    in pins, 9 ; read 15 bits from pins to ISR
+    in null, 31 ; push 31 zeroes to ISR, keep only the bit for CS
     mov x, isr ; read ISR into x
-    jmp !x readstall ; jmp to readstall if x(cs) is zero
+    jmp !x readstall ; jmp to readstall if x(CS) is zero
 .wrap
 
 
+; Monitor the WR signal and push data onto the TX FIFO when it is low
 .program writedata
-
 start:
-; Wait for CS to assert low
-
-    wait 0 GPIO 16
+    wait 0 GPIO 10 ; Wait for CS to assert low
     jmp pin start ; jmp to start if wr is not zero
     in pins, 8 ; read 8 bits from pins to ISR
     in null, 24 ; push 24 zeroes to ISR
-    push noblock ; push the 8-bit word onto the RX FIFO
+    push noblock ; push the 8-bit word onto the TX FIFO
 
 writestall:
     jmp pin start ; jmp to start if wr is not zero
-    in pins, 15 ; read 15 bits from pins to ISR
+    in pins, 9 ; read 15 bits from pins to ISR
     in null, 31 ; push 31 zeroes to ISR
     mov x, isr ; read ISR into x
     jmp !x writestall ; jmp to writestall if x(cs) is zero
+.wrap
 
-    ; wrap to beginning of program
+/*
+.program dataout
+    pull block    ; Load a 32-bit word from the RX FIFO into the OSR, stall if FIFO empty
+    ; if addr pin is high, shift isr right by 8 bits to output status
+    mov isr, osr
+    in null, 8
+    mov osr, isr
+    ; if addr pin is high, shift isr right by 8 bits
+    in null, 8
+    out pins, 8   ; Output the lower 8 bits of the OSR to the data pins
+.wrap
+*/

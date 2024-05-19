@@ -9,6 +9,7 @@ pico_sdk_init()
 
 add_executable(pico232h
     main.c
+    cpu-fifo.c
 )
 
 pico_enable_stdio_uart(pico232h 1)
@@ -21,5 +22,5 @@ pico_generate_pio_header(pico232h ${CMAKE_CURRENT_LIST_DIR}/cpu-fifo.pio)
 
 # target_sources(pio_blink PRIVATE blink.c)
 
-target_link_libraries(pico232h pico_stdlib hardware_pio)
+target_link_libraries(pico232h pico_stdlib hardware_pio pico_multicore)
 pico_add_extra_outputs(pico232h)
