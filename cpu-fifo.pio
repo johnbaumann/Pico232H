@@ -16,16 +16,6 @@
 .define IRQ_READDATA_PIO    4
 .define IRQ_READSTATUS_PIO  5
 .define IRQ_WRITEDATA_PIO   6
-
-.program readstatus
-    wait 1 irq IRQ_READSTATUS_PIO
-    pull noblock
-    mov x, osr
-    out pins, 8
-    irq nowait IRQ_READSTATUS_SYS
-.wrap
-
-
 .program readdata
     wait 1 irq IRQ_READDATA_PIO
     pull noblock
@@ -38,10 +28,7 @@
 .program cpufifo
 
 .define PIO_BASE    2
-.define PIO_CS      (GPIO_CS - PIO_BASE + 1)
 .define PIO_ADDR    (GPIO_ADDR - PIO_BASE + 1)
-.define PIO_RD      (GPIO_RD - PIO_BASE + 1)
-.define PIO_WR      (GPIO_WR - PIO_BASE + 1)
 
 start:
     mov osr, null       ; clear OSR
@@ -58,7 +45,9 @@ idle:
     jmp !y doData                   ; Address pin is low, don't shift(send data not status)
 
 doStatus:
-    irq wait IRQ_READSTATUS_PIO
+    pull noblock
+    out pins, 8
+    irq nowait IRQ_READSTATUS_SYS
     jmp setPinsAsOutput
 
 doData:
@@ -70,20 +59,13 @@ setPinsAsOutput:
     out pindirs, 8      ; set data pins as output
 
 readstall:
-; Wait for OE and CE to be high
-    jmp pin start       ; jmp to start if rd is not zero
-    in pins, PIO_CS     ; read 9 bits from pins to ISR
-    in null, 31         ; push 31 zeroes to ISR, keep only the bit for CS
-    mov y, isr          ; read ISR into x
-    jmp !y readstall    ; jmp to readstall if x(CS) is zero
+; Wait for RD to finish
+    WAIT 1 GPIO GPIO_RD
 .wrap
 
 
 ; Monitor the WR signal and push data onto the TX FIFO when it is low
 .program writedata
-
-.define PIO_BASE 2
-.define PIO_CS GPIO_CS - PIO_BASE + 1
 
 start:
     wait 0 GPIO GPIO_CS ; Wait for CS to assert low
@@ -93,9 +75,6 @@ start:
     push noblock        ; push the 8-bit word onto the TX FIFO
 
 writestall:
-    jmp pin start       ; jmp to start if wr is not zero
-    in pins, PIO_CS     ; read up to CS from pins to ISR
-    in null, 31         ; Shift all but CS bits out
-    mov x, isr          ; read ISR into x so we can branch on CS
-    jmp !x writestall   ; jmp to writestall if x(cs) is zero
+; Wait for WR to finish
+    wait 1 GPIO GPIO_WR
 .wrap
