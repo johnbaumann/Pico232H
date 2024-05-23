@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
 add_executable(pico232h
+    fifo.c
     main.c
     cpu-fifo.c
 )

@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include "fifo.h"
+
 #include <stdio.h>
 
 #include "pico/stdlib.h"
@@ -16,14 +18,9 @@
 #define FT_STATUS_SUSPEND 0x04         // SUSP
 #define FT_STATUS_CONFIGURED 0x08      // CONFIG
 
-#define STAT_DATASENT (1U << 8U)
-
-void init_cpu_fifo();
-void core1_main();
-
-char fifo_head = 0;
-char fifo_tail = 0;
-char fifo[8];
+#define IRQ_READDATA_SYS 0
+#define IRQ_READSTATUS_SYS 1
+#define IRQ_WRITEDATA_SYS 2
 
 union datastatus
 {
@@ -37,46 +34,20 @@ union datastatus
 
 union datastatus datastatus_reg;
 
-bool fifo_empty()
-{
-    return fifo_head == fifo_tail;
-}
+static PIO pio_cpufifo = pio1;
+static PIO pio_writefifo = pio1;
 
-bool fifo_full()
-{
-    return fifo_head == (fifo_tail + 1) % 8;
-}
+static uint sm_cpufifo;
+static uint sm_readdata;
+static uint sm_readstatus;
 
-char fifo_peek()
-{
-    if (fifo_head == fifo_tail)
-    {
-        return 0;
-    }
-    return fifo[fifo_head];
-}
+static uint sm_writedata;
 
-char fifo_pop()
-{
-    if (fifo_head == fifo_tail)
-    {
-        return 0;
-    }
-    char data = fifo[fifo_head];
-    fifo_head = (fifo_head + 1) % 8;
-    return data;
-}
+static int8_t pio_irq_data;
+static int8_t pio_irq_status;
 
-bool fifo_push(int data)
-{
-    if (fifo_full())
-    {
-        return false;
-    }
-    fifo[fifo_tail] = data;
-    fifo_tail = (fifo_tail + 1) % 8;
-    return true;
-}
+void init_cpu_fifo();
+void core1_main();
 
 int main()
 {
@@ -93,80 +64,180 @@ int main()
     }
 }
 
-void update_fifo_flag()
+static inline void update_status_register()
 {
-    datastatus_reg.status |= FT_STATUS_DATA_AVAILABLE;
-    /*if(fifo_empty())
+    if (pio_sm_is_tx_fifo_empty(pio_cpufifo, sm_readdata))
     {
         datastatus_reg.status &= ~FT_STATUS_DATA_AVAILABLE;
     }
     else
     {
         datastatus_reg.status |= FT_STATUS_DATA_AVAILABLE;
-    }*/
+    }
 }
 
-void init_cpu_fifo()
+static void pio_data_irq_func(void)
 {
-    static PIO pio_cpufifo = pio0;
-    static PIO pio_writefifo = pio1;
+    // Update the status register fifo
+    pio_sm_drain_tx_fifo(pio_cpufifo, sm_readstatus);
+    update_status_register();
+    pio_cpufifo->txf[sm_readstatus] = datastatus_reg.status;
 
+    // Update the data register fifo
+    if (!fifo_empty())
+    {
+        datastatus_reg.data = fifo_pop();
+        pio_cpufifo->txf[sm_readdata] = datastatus_reg.value;
+    }
+    pio_interrupt_clear(pio_cpufifo, IRQ_READDATA_SYS);
+}
+
+static void pio_status_irq_func(void)
+{
+    uint8_t irq_mask = pio_cpufifo->irq & 0xff;
+
+    pio_sm_drain_tx_fifo(pio_cpufifo, sm_readstatus);
+    update_status_register();
+    pio_cpufifo->txf[sm_readstatus] = datastatus_reg.status;
+
+    if (irq_mask & (1u << IRQ_READSTATUS_SYS))
+    {
+        pio_interrupt_clear(pio_cpufifo, IRQ_READSTATUS_SYS);
+    }
+
+    if (irq_mask & (1u << IRQ_READDATA_SYS))
+    {
+        pio_interrupt_clear(pio_cpufifo, IRQ_READDATA_SYS);
+    }
+}
+
+void cpufifo_program_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = cpufifo_program_get_default_config(offset);
     // Setup data pins and data out state machine
     static const uint base_data_pin = 2;
-    static const uint data_mask = (uint)(0xff) << base_data_pin;
     static const uint cs_pin = 10;
     static const uint addr_pin = 11;
     static const uint rd_pin = 12;
-    static const uint wr_pin = 13;
-    static const uint oe_pin = 15;
 
-    //uint sm_dataout = pio_claim_unused_sm(pio_cpufifo, true);
-    uint sm_readdata = pio_claim_unused_sm(pio_cpufifo, true);
-    uint sm_writedata = pio_claim_unused_sm(pio_writefifo, true);
+    static const uint pin_count = rd_pin - base_data_pin;
 
-    // Setup DATA pins
-    for (uint pin = 0; pin < 8; pin++)
+    // Data pins
+    for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
     {
-        pio_gpio_init(pio_cpufifo, base_data_pin + pin);
-        gpio_set_input_enabled(base_data_pin + pin, false);
+        pio_gpio_init(pio, pin);
+        gpio_set_input_enabled(pin, false);
     }
 
-    // CS + Addr + RD + WR pins
-    for (uint pin = cs_pin; pin < wr_pin + 1; pin++)
+    // CS + Addr + RD pins
+    for (uint pin = cs_pin; pin <= rd_pin; pin++)
     {
-        pio_gpio_init(pio_cpufifo, pin);
+        pio_gpio_init(pio, pin);
         gpio_set_pulls(pin, true, false);
         gpio_set_input_enabled(pin, true);
     }
 
-    // Setup data out state machine
-    //uint offset_dataout = pio_add_program(pio_cpufifo, &dataout_program);
-    //pio_sm_config c_dataout = dataout_program_get_default_config(offset_dataout);
+    pio_sm_set_consecutive_pindirs(pio, sm, base_data_pin, pin_count, false);
 
-    //sm_config_set_out_pins(&c_dataout, base_data_pin, 8);
-    //sm_config_set_out_shift(&c_dataout, true, true, 32);
+    sm_config_set_in_pins(&c, base_data_pin);
+    sm_config_set_out_pins(&c, base_data_pin, 8);
+    sm_config_set_jmp_pin(&c, rd_pin);
+    sm_config_set_in_shift(&c, true, false, 32);
+    sm_config_set_out_shift(&c, true, true, 32);
 
-    //pio_sm_init(pio_cpufifo, sm_dataout, offset_dataout, &c_dataout);
-    //pio_sm_set_enabled(pio_cpufifo, sm_dataout, true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+void readdata_program_init(PIO pio, uint sm, uint offset)
+{
+    static const uint base_data_pin = 2;
+
+    pio_sm_config c = readdata_program_get_default_config(offset);
+
+    // Data pins
+    for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
+    {
+        pio_gpio_init(pio, pin);
+        gpio_set_input_enabled(pin, false);
+    }
+
+    pio_sm_set_consecutive_pindirs(pio, sm, base_data_pin, 8, false);
+    sm_config_set_out_pins(&c, base_data_pin, 8);
+    sm_config_set_out_shift(&c, true, false, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    pio_set_irqn_source_enabled(pio, pio_irq_status, pis_interrupt0, true);                                       // Set pio to tell us when irq0 is raised
+    pio_interrupt_clear(pio, IRQ_READDATA_SYS);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+void readstatus_program_init(PIO pio, uint sm, uint offset)
+{
+    static const uint base_data_pin = 2;
+
+    pio_sm_config c = readstatus_program_get_default_config(offset);
+
+    // Data pins
+    for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
+    {
+        pio_gpio_init(pio, pin);
+        gpio_set_input_enabled(pin, false);
+    }
+
+    pio_sm_set_consecutive_pindirs(pio, sm, base_data_pin, 8, false);
+    sm_config_set_out_pins(&c, base_data_pin, 8);
+    sm_config_set_out_shift(&c, true, false, 8);
+
+    pio_irq_status = (pio == pio0) ? PIO0_IRQ_0 : PIO1_IRQ_0;
+    if (irq_get_exclusive_handler(pio_irq_status))
+    {
+        pio_irq_status++;
+        if (irq_get_exclusive_handler(pio_irq_status))
+        {
+            panic("All IRQs are in use");
+        }
+    }
+
+    // Enable interrupt
+    irq_add_shared_handler(pio_irq_status, pio_status_irq_func, PICO_SHARED_IRQ_HANDLER_HIGHEST_ORDER_PRIORITY); // Add a shared IRQ handler
+    // irq_set_exclusive_handler(pio_irq_status, pio_status_irq_func);                    // Add an exclusive IRQ handler
+    irq_set_enabled(pio_irq_status, true);                                             // Enable the IRQ
+    const uint irq_index = pio_irq_status - ((pio == pio0) ? PIO0_IRQ_0 : PIO1_IRQ_0); // Get index of the IRQ
+    pio_set_irqn_source_enabled(pio, irq_index, pis_interrupt1, true);                 // Set pio to tell us when irq1 is raised
+    pio_interrupt_clear(pio, IRQ_READSTATUS_SYS);                                      // Clear any pending interrupts
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+void init_cpu_fifo()
+{
+    static const uint base_data_pin = 2;
+    static const uint cs_pin = 10;
+    static const uint addr_pin = 11;
+    static const uint wr_pin = 13;
+
+    sm_cpufifo = pio_claim_unused_sm(pio_cpufifo, true);
+    sm_readdata = pio_claim_unused_sm(pio_cpufifo, true);
+    sm_readstatus = pio_claim_unused_sm(pio_cpufifo, true);
+    // sm_writedata = pio_claim_unused_sm(pio_cpufifo, true);
 
     // Setup read data state machine(read data from RP2040)
+    uint offset_cpufifo = pio_add_program(pio_cpufifo, &cpufifo_program);
     uint offset_readdata = pio_add_program(pio_cpufifo, &readdata_program);
-    pio_sm_config c_readdata = readdata_program_get_default_config(offset_readdata);
+    uint offset_readstatus = pio_add_program(pio_cpufifo, &readstatus_program);
 
-    pio_sm_set_consecutive_pindirs(pio_cpufifo, sm_readdata, base_data_pin, cs_pin - base_data_pin, false);
-    pio_sm_set_consecutive_pindirs(pio_writefifo, sm_writedata, base_data_pin, cs_pin - base_data_pin, false);
-    sm_config_set_in_pins(&c_readdata, base_data_pin);
-    sm_config_set_out_pins(&c_readdata, base_data_pin, 8);
-    sm_config_set_jmp_pin(&c_readdata, rd_pin);
-    sm_config_set_in_shift(&c_readdata, true, false, 32);
-    sm_config_set_out_shift(&c_readdata, true, true, 32);
-
-    pio_sm_init(pio_cpufifo, sm_readdata, offset_readdata, &c_readdata);
-    pio_sm_set_enabled(pio_cpufifo, sm_readdata, true);
+    cpufifo_program_init(pio_cpufifo, sm_cpufifo, offset_cpufifo);
+    readdata_program_init(pio_cpufifo, sm_readdata, offset_readdata);
+    readstatus_program_init(pio_cpufifo, sm_readstatus, offset_readstatus);
 
     // Setup WR state machine
-    pio_gpio_init(pio_cpufifo, cs_pin);
-    pio_gpio_init(pio_cpufifo, wr_pin);
+    /*pio_sm_set_consecutive_pindirs(pio_writefifo, sm_writedata, base_data_pin, cs_pin - base_data_pin, false);
+    pio_gpio_init(pio_writefifo, cs_pin);
+    pio_gpio_init(pio_writefifo, wr_pin);
     gpio_set_pulls(cs_pin, true, false);
     gpio_set_pulls(wr_pin, true, false);
     gpio_set_input_enabled(cs_pin, true);
@@ -175,9 +246,9 @@ void init_cpu_fifo()
     uint offset_writedata = pio_add_program(pio_writefifo, &writedata_program);
     pio_sm_config c_writedata = writedata_program_get_default_config(offset_writedata);
 
-    for (uint pin = base_data_pin; pin <= cs_pin; pin++)
+    for (uint pin = base_data_pin; pin <= wr_pin; pin++)
     {
-        pio_gpio_init(pio_cpufifo, pin);
+        pio_gpio_init(pio_writefifo, pin);
         gpio_set_input_enabled(pin, true);
     }
     sm_config_set_in_pins(&c_writedata, base_data_pin);
@@ -185,46 +256,43 @@ void init_cpu_fifo()
     sm_config_set_in_shift(&c_writedata, true, false, 32);
 
     pio_sm_init(pio_writefifo, sm_writedata, offset_writedata, &c_writedata);
-    pio_sm_set_enabled(pio_writefifo, sm_writedata, true);
+    pio_sm_set_enabled(pio_writefifo, sm_writedata, true);*/
 
     char temp = 0;
 
     // Set initial data
     datastatus_reg.data = 0xff;
     datastatus_reg.status = FT_STATUS_CONFIGURED | FT_STATUS_SPACE_AVAILABLE;
-    
-    pio_cpufifo->txf[sm_readdata] = datastatus_reg.value;
+
+    pio_cpufifo->txf[sm_readstatus] = datastatus_reg.status;
 
     while (true)
     {
         // addr = gpio_get(addr_pin) > 0;
 
-        if (!fifo_full() && uart_is_readable(uart0)) // RX
+        if (!pio_sm_is_tx_fifo_full(pio_cpufifo, sm_readdata) && uart_is_readable(uart0)) // RX
         {
             temp = uart_getc(uart0);
-            fifo_push(temp);
-            update_fifo_flag();
-            //printf("%c", temp); // Echo character
+            pio_cpufifo->txf[sm_readdata] = temp;
+            while(pio_sm_is_tx_fifo_empty(pio_cpufifo, sm_readdata))
+                ;
+            update_status_register();
+            pio_sm_drain_tx_fifo(pio_cpufifo, sm_readstatus);
+            pio_cpufifo->txf[sm_readstatus] = datastatus_reg.status;
+            printf("%c", temp); // Echo character
         }
 
-        if (!pio_sm_is_rx_fifo_empty(pio_cpufifo, sm_readdata))
-        {
-            printf("Byte read from: %x\n", pio_cpufifo->rxf[sm_readdata]);
-            //pio_cpufifo->txf[sm_dataout] = datastatus_reg.value;
-        }
-
-        if (!fifo_empty() && pio_sm_is_tx_fifo_full(pio_cpufifo, sm_readdata) == false) // TX
+        /*if (!fifo_empty() && pio_sm_is_tx_fifo_full(pio_cpufifo, sm_readdata) == false) // TX
         {
             datastatus_reg.data = fifo_pop();
-            update_fifo_flag();
             printf("Sending: %x\n", datastatus_reg.value);
             pio_cpufifo->txf[sm_readdata] = datastatus_reg.value;
-        }
+        }*/
 
         // TX
-        if (!pio_sm_is_rx_fifo_empty(pio_writefifo, sm_writedata))
+        /*if (!pio_sm_is_rx_fifo_empty(pio_writefifo, sm_writedata))
         {
             printf("Received: %x\n", pio_writefifo->rxf[sm_writedata]);
-        }
+        }*/
     }
 }

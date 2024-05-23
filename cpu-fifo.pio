@@ -4,43 +4,68 @@
 ; SPDX-License-Identifier: BSD-3-Clause
 ;
 
-.define GPIO_CS 10
-.define GPIO_ADDR 11
-.define GPIO_RD 12
-.define GPIO_WR 13
+.define GPIO_CS     10
+.define GPIO_ADDR   11
+.define GPIO_RD     12
+.define GPIO_WR     13
+
+.define IRQ_READDATA_SYS    0
+.define IRQ_READSTATUS_SYS  1
+.define IRQ_WRITEDATA_SYS   2
+
+.define IRQ_READDATA_PIO    4
+.define IRQ_READSTATUS_PIO  5
+.define IRQ_WRITEDATA_PIO   6
+
+.program readstatus
+    wait 1 irq IRQ_READSTATUS_PIO
+    pull noblock
+    mov x, osr
+    out pins, 8
+    irq nowait IRQ_READSTATUS_SYS
+.wrap
+
+
+.program readdata
+    wait 1 irq IRQ_READDATA_PIO
+    pull noblock
+    out pins, 8
+    irq nowait IRQ_READDATA_SYS
+.wrap
+
 
 ; Monitor the RD signal
-.program readdata
+.program cpufifo
 
-.define PIO_BASE 2
-.define PIO_CS GPIO_CS - PIO_BASE + 1
-.define PIO_ADDR GPIO_ADDR - PIO_BASE + 1
-.define PIO_RD GPIO_RD - PIO_BASE + 1
-.define PIO_WR GPIO_WR - PIO_BASE + 1
+.define PIO_BASE    2
+.define PIO_CS      (GPIO_CS - PIO_BASE + 1)
+.define PIO_ADDR    (GPIO_ADDR - PIO_BASE + 1)
+.define PIO_RD      (GPIO_RD - PIO_BASE + 1)
+.define PIO_WR      (GPIO_WR - PIO_BASE + 1)
 
 start:
     mov osr, null       ; clear OSR
-    out pindirs, 8      ; weakly pull up / disable output
+    out pindirs, 8      ; OSR to pindirs, disable output
 
 idle:
     wait 0 GPIO GPIO_CS ; wait for CS to assert low
     jmp pin idle        ; jmp to idle if rd not asserted
 
-; Pull data from FIFO, mask address pin, shift by 8 bits if addr > 1, output data
-    in pins, PIO_ADDR   ; Read pins up to Address bit
-    in null, 31         ; Shift out the other bits
-    mov x, isr          ; Copy ISR to x so we can branch on address pin
-    push noblock        ; push address pin onto the TX FIFO for upstream
-    pull noblock        ; Load a 32-bit word from the RX FIFO into the OSR
-    jmp !x pushdata     ; Address pin is low, don't shift(send data not status)
+    ; Pull data from FIFO, mask address pin, shift by 8 bits if addr > 1, output data
+    in pins, PIO_ADDR               ; Read pins up to Address bit
+    in null, 31                     ; Shift out the other bits
+    mov y, isr                      ; Copy ISR to y so we can branch on address pin
+    jmp !y doData                   ; Address pin is low, don't shift(send data not status)
 
-    ; Address pin is high, shift ISR right by 8 bits
-    out null, 8
+doStatus:
+    irq wait IRQ_READSTATUS_PIO
+    jmp setPinsAsOutput
 
-pushdata:
-    out pins, 8         ; Output the lower 8 bits of the OSR to the data pins
+doData:
+    irq wait IRQ_READDATA_PIO
 
-; Toggle data pins as outputs, notify the upstream device that a byte was read
+setPinsAsOutput:
+    ; Toggle data pins as outputs, notify the upstream device that a byte was read
     mov osr, ~null      ; set OSR to all ones
     out pindirs, 8      ; set data pins as output
 
@@ -49,8 +74,8 @@ readstall:
     jmp pin start       ; jmp to start if rd is not zero
     in pins, PIO_CS     ; read 9 bits from pins to ISR
     in null, 31         ; push 31 zeroes to ISR, keep only the bit for CS
-    mov x, isr          ; read ISR into x
-    jmp !x readstall    ; jmp to readstall if x(CS) is zero
+    mov y, isr          ; read ISR into x
+    jmp !y readstall    ; jmp to readstall if x(CS) is zero
 .wrap
 
 
@@ -71,6 +96,6 @@ writestall:
     jmp pin start       ; jmp to start if wr is not zero
     in pins, PIO_CS     ; read up to CS from pins to ISR
     in null, 31         ; Shift all but CS bits out
-    mov x, isr          ; read ISR into x
+    mov x, isr          ; read ISR into x so we can branch on CS
     jmp !x writestall   ; jmp to writestall if x(cs) is zero
 .wrap
