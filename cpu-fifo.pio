@@ -9,18 +9,18 @@
 .define GPIO_RD     12
 .define GPIO_WR     13
 
-.define IRQ_READDATA_SYS    0
-.define IRQ_READSTATUS_SYS  1
-.define IRQ_WRITEDATA_SYS   2
+.define IRQ_UPDATESTATUS    0
 
 .define IRQ_READDATA_PIO    4
 .define IRQ_READSTATUS_PIO  5
 .define IRQ_WRITEDATA_PIO   6
+
+
 .program readdata
     wait 1 irq IRQ_READDATA_PIO
     pull noblock
     out pins, 8
-    irq nowait IRQ_READDATA_SYS
+    irq wait IRQ_UPDATESTATUS
 .wrap
 
 
@@ -47,7 +47,6 @@ idle:
 doStatus:
     pull noblock
     out pins, 8
-    irq nowait IRQ_READSTATUS_SYS
     jmp setPinsAsOutput
 
 doData:
@@ -57,6 +56,7 @@ setPinsAsOutput:
     ; Toggle data pins as outputs, notify the upstream device that a byte was read
     mov osr, ~null      ; set OSR to all ones
     out pindirs, 8      ; set data pins as output
+    irq wait IRQ_UPDATESTATUS
 
 readstall:
 ; Wait for RD to finish
@@ -71,10 +71,10 @@ start:
     wait 0 GPIO GPIO_CS ; Wait for CS to assert low
     jmp pin start       ; jmp to start if wr is not zero
     in pins, 8          ; read 8 bits from pins to ISR
-    in null, 24         ; push 24 zeroes to ISR
     push noblock        ; push the 8-bit word onto the TX FIFO
 
 writestall:
 ; Wait for WR to finish
+    irq wait IRQ_UPDATESTATUS
     wait 1 GPIO GPIO_WR
 .wrap
