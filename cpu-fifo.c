@@ -1,6 +1,3 @@
-// Core 0 - UART Transciever
-// Core 1 - Parallel FIFO
-
 #include "cpu-fifo.pio.h"
 
 #include <stdbool.h>
