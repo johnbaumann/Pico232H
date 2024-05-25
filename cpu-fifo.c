@@ -20,7 +20,7 @@
 
 uint8_t statusreg = FT_STATUS_CONFIGURED | FT_STATUS_SPACE_AVAILABLE;
 
-static PIO pio_instance = pio1;
+static PIO pio_instance = pio0;
 
 static uint sm_cpufifo;
 static uint sm_readdata;
