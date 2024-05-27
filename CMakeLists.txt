@@ -12,7 +12,7 @@ add_executable(pico232h
     main.c
 )
 
-pico_set_binary_type(pico232h no_flash)
+pico_set_binary_type(pico232h copy_to_ram)
 
 pico_enable_stdio_uart(pico232h 1)
 pico_enable_stdio_usb(pico232h 1)

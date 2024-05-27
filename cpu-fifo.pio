@@ -49,7 +49,7 @@ setPinsAsOutput:
     out pindirs, 8              ; set data pins as output
 
 readstall:
-    irq wait IRQ_UPDATESTATUS   ; Wait for cpu to update status bit
+    irq nowait IRQ_UPDATESTATUS   ; Wait for cpu to update status bit
     WAIT 1 GPIO GPIO_RD         ; Wait for RD to finish
 .wrap
 
@@ -64,6 +64,6 @@ start:
     push noblock                ; push the data onto the RX FIFO
 
 writestall:
-    irq wait IRQ_UPDATESTATUS   ; Wait for cpu to update status bit
+    irq nowait IRQ_UPDATESTATUS   ; Wait for cpu to update status bit
     wait 1 GPIO GPIO_WR         ; Wait for WR to finish
 .wrap

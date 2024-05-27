@@ -8,6 +8,10 @@
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 
+#include "tusb.h"
+#include "tusb_fifo.h"
+#include "pico/stdio_usb.h"
+
 #define FT_STATUS_DATA_AVAILABLE 0x01  // RXF
 #define FT_STATUS_SPACE_AVAILABLE 0x02 // TXE
 // #define FT_STATUS_SUSPEND 0x04         // SUSP
@@ -62,26 +66,39 @@ void cpu_fifo(void)
 
     while (true)
     {
+#if LIB_PICO_STDIO_USB
+        if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && tud_cdc_read) // UART RX -> PIO TX
+        {
+            temp = getchar_timeout_us(0);
+            if (temp != PICO_ERROR_TIMEOUT)
+            {
+                pio_instance->txf[sm_readdata] = temp;
+                update_status_register();
+            }
+        }
+
+        // TX
+        if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata) && tud_cdc_write_available() > 0) // PIO RX -> UART TX
+        {
+            uint8_t dataout = pio_instance->rxf[sm_writedata];
+            update_status_register();
+            putchar_raw(dataout);
+            stdio_flush();
+        }
+#else
         if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && uart_is_readable(uart0)) // UART RX -> PIO TX
         {
             pio_instance->txf[sm_readdata] = uart_getc(uart0);
             update_status_register();
-            // temp = getchar_timeout_us(0);
-            /*if (temp != PICO_ERROR_TIMEOUT)
-            {
-                pio_instance->txf[sm_readdata] = temp;
-                update_status_register();
-            }*/
-            // printf("%c", temp); // Echo character
         }
 
         // TX
         if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata) && uart_is_writable(uart0)) // PIO RX -> UART TX
         {
             uart_putc_raw(uart0, pio_instance->rxf[sm_writedata]);
-            // printf("%c", pio_instance->rxf[sm_writedata]);
-            // putchar_raw(pio_instance->rxf[sm_writedata]);
+            update_status_register();
         }
+#endif
     }
 }
 
@@ -166,10 +183,6 @@ void init_readdata_program(PIO pio, uint sm, uint offset)
 
 void init_writedata_program(PIO pio, uint sm, uint offset)
 {
-    static const uint base_data_pin = 2;
-    static const uint cs_pin = 10;
-    static const uint wr_pin = 13;
-
     // Setup WR state machine
     pio_sm_set_consecutive_pindirs(pio, sm_writedata, base_data_pin, cs_pin - base_data_pin, false);
     pio_gpio_init(pio, cs_pin);
