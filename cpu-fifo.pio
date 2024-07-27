@@ -24,6 +24,7 @@
 .define PIO_BASE    2
 .define PIO_ADDR    (GPIO_ADDR - PIO_BASE + 1)
 
+
 start:
     mov osr, null               ; clear OSR
     out pindirs, 8              ; OSR to pindirs, disable output

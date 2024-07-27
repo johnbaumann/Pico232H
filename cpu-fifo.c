@@ -1,16 +1,16 @@
+// To-do: Bug with status register, getting a random value on FIFO when first booting
+
 #include "cpu-fifo.pio.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <tusb.h>
 
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
-
-#include "tusb.h"
-#include "tusb_fifo.h"
-#include "pico/stdio_usb.h"
+#include "pico/platform.h"
 
 #define FT_STATUS_DATA_AVAILABLE 0x01  // RXF
 #define FT_STATUS_SPACE_AVAILABLE 0x02 // TXE
@@ -44,6 +44,51 @@ void init_writedata_program(PIO pio, uint sm, uint offset);
 static void status_irq_handler(void);
 static void update_status_register(void);
 
+void core1_entry()
+{
+    tusb_init();
+
+    while (1)
+    {
+        tud_task();
+
+        // USB READ, USB RX -> PIO TX
+        if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && tud_cdc_n_available(0))
+        {
+            uint cdc_available = tud_cdc_n_available(0);
+            uint pio_fifo_space = 8 - pio_sm_get_tx_fifo_level(pio_instance, sm_readdata);
+            uint len = MIN(pio_fifo_space, cdc_available);
+            uint8_t datain[8];
+            uint count = tud_cdc_n_read(0, &datain, len);
+
+            for (uint i = 0; i < count; i++)
+            {
+                pio_instance->txf[sm_readdata] = datain[i];
+            }
+            update_status_register();
+        }
+
+        // USB WRITE, PIO RX -> USB TX
+        if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata))
+        {
+            uint len = pio_sm_get_rx_fifo_level(pio_instance, sm_writedata);
+            uint8_t dataout[len];
+            for (uint i = 0; i < len; i++)
+            {
+                dataout[i] = pio_instance->rxf[sm_writedata];
+            }
+
+            // Data gets discarded if the USB is not connected
+            if (tud_cdc_n_connected(0))
+            {
+                tud_cdc_n_write(0, &dataout, len);
+                tud_cdc_n_write_flush(0);
+            }
+            update_status_register();
+        }
+    }
+}
+
 void cpu_fifo(void)
 {
     sm_cpufifo = pio_claim_unused_sm(pio_instance, true);
@@ -60,45 +105,11 @@ void cpu_fifo(void)
 
     pio_status_irq = enable_irq(pio_instance, status_irq_handler, IRQ_UPDATESTATUS);
 
-    int16_t temp = 0;
-
     update_status_register();
 
     while (true)
     {
-#if LIB_PICO_STDIO_USB
-        if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && tud_cdc_read) // UART RX -> PIO TX
-        {
-            temp = getchar_timeout_us(0);
-            if (temp != PICO_ERROR_TIMEOUT)
-            {
-                pio_instance->txf[sm_readdata] = temp;
-                update_status_register();
-            }
-        }
-
-        // TX
-        if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata) && tud_cdc_write_available() > 0) // PIO RX -> UART TX
-        {
-            uint8_t dataout = pio_instance->rxf[sm_writedata];
-            update_status_register();
-            putchar_raw(dataout);
-            stdio_flush();
-        }
-#else
-        if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && uart_is_readable(uart0)) // UART RX -> PIO TX
-        {
-            pio_instance->txf[sm_readdata] = uart_getc(uart0);
-            update_status_register();
-        }
-
-        // TX
-        if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata) && uart_is_writable(uart0)) // PIO RX -> UART TX
-        {
-            uart_putc_raw(uart0, pio_instance->rxf[sm_writedata]);
-            update_status_register();
-        }
-#endif
+        // sleep_ms(1000);
     }
 }
 
@@ -137,14 +148,17 @@ void init_cpufifo_program(PIO pio, uint sm, uint offset)
     for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
     {
         pio_gpio_init(pio, pin);
+        gpio_set_pulls(pin, false, false);
         gpio_set_input_enabled(pin, false);
+        gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
+        gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_4MA);
     }
 
     // CS + Addr + RD pins
     for (uint pin = cs_pin; pin <= rd_pin; pin++)
     {
         pio_gpio_init(pio, pin);
-        gpio_set_pulls(pin, true, false);
+        gpio_set_pulls(pin, false, false);
         gpio_set_input_enabled(pin, true);
     }
 
@@ -187,8 +201,8 @@ void init_writedata_program(PIO pio, uint sm, uint offset)
     pio_sm_set_consecutive_pindirs(pio, sm_writedata, base_data_pin, cs_pin - base_data_pin, false);
     pio_gpio_init(pio, cs_pin);
     pio_gpio_init(pio, wr_pin);
-    gpio_set_pulls(cs_pin, true, false);
-    gpio_set_pulls(wr_pin, true, false);
+    gpio_set_pulls(cs_pin, false, false);
+    gpio_set_pulls(wr_pin, false, false);
     gpio_set_input_enabled(cs_pin, true);
     gpio_set_input_enabled(wr_pin, true);
 
