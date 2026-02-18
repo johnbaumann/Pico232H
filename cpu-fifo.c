@@ -1,254 +1,268 @@
-// To-do: Bug with status register, getting a random value on FIFO when first booting
+// To-do: Bug with status register, getting a random value on FIFO when first
+// booting
+
+#include <hardware/dma.h>
+#include <hardware/irq.h>
+#include <hardware/pio.h>
+#include <hardware/regs/pio.h>
+#include <pico/multicore.h>
+#include <pico/platform.h>
+#include <pico/platform/common.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <tusb.h>
 
 #include "cpu-fifo.pio.h"
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <tusb.h>
+typedef struct {
+    int readProgramOffset;
+    int statusProgramOffset;
+    int writeProgramOffset;
+} programOffsets;
 
-#include "pico/stdlib.h"
-#include "hardware/pio.h"
-#include "hardware/clocks.h"
-#include "pico/platform.h"
+typedef struct {
+    int channelA;
+    int channelB;
+} statusChannels;
 
-#define FT_STATUS_DATA_AVAILABLE 0x01  // RXF
-#define FT_STATUS_SPACE_AVAILABLE 0x02 // TXE
-// #define FT_STATUS_SUSPEND 0x04         // SUSP
-#define FT_STATUS_CONFIGURED 0x08 // CONFIG
+enum Pin {
+    PIN_CS = 1u,
+    PIN_D0 = 3u,
+    PIN_D1 = 4u,
+    PIN_D2 = 5u,
+    PIN_D3 = 6u,
+    PIN_D4 = 7u,
+    PIN_D5 = 8u,
+    PIN_D6 = 9u,
+    PIN_D7 = 10u,
+    PIN_RD = 12u,
+    PIN_WR = 13u,
+    PIN_A0 = 14u,
+    // The pins below are not physical connections
+    // These are used for internal purposes only
+    STATUS_D0 = 17u,
+    STATUS_D1 = 18u,
+    STATUS_D2 = 19u,
+    STATUS_D3 = 20u,
+    STATUS_D4 = 21u,
+    STATUS_D5 = 22u,
+    STATUS_D6 = 23u,
+    STATUS_D7 = 24u,
+};
 
-#define IRQ_UPDATESTATUS 0
+static volatile unsigned int s_statusRegister = 0x0a;
 
-uint8_t statusreg = FT_STATUS_CONFIGURED | FT_STATUS_SPACE_AVAILABLE;
+static const PIO s_pioInstance = pio0;
+static const unsigned int s_smRead = 0;
+static const unsigned int s_smStatus = 1;
+static const unsigned int s_smWrite = 2;
 
-static PIO pio_instance = pio0;
+static void core1_entry(void);
+static statusChannels initDMA(void);
+static void initGPIO(void);
+static programOffsets initPIO(void);
+static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset);
+static void initProgramStatus(const PIO pio, const unsigned int sm, const unsigned int offset);
+static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset);
+static void statusIRQHandler(void);
+static void updateStatusRegister(void);
+static void usbRead(void);
+static void usbWrite(void);
 
-static uint sm_cpufifo;
-static uint sm_readdata;
-static uint sm_writedata;
+static void core1_entry() {
+    while (true) {
+        updateStatusRegister();
+    }
+}
 
-static int8_t pio_status_irq;
+void cpu_fifo(void) {
+    initGPIO();
 
-static const uint base_data_pin = 2;
-static const uint cs_pin = 10;
-static const uint addr_pin = 11;
-static const uint rd_pin = 12;
-static const uint wr_pin = 13;
-// static const uint oe_pin = 15;
+    const programOffsets offsets = initPIO();
 
-void cpu_fifo(void);
-static int8_t enable_irq(PIO pio, irq_handler_t handler, uint irq_num);
-void init_cpufifo_program(PIO pio, uint sm, uint offset);
-void init_readdata_program(PIO pio, uint sm, uint offset);
-void init_writedata_program(PIO pio, uint sm, uint offset);
-static void status_irq_handler(void);
-static void update_status_register(void);
+    multicore_launch_core1(core1_entry);
 
-void core1_entry()
-{
+    const statusChannels channels = initDMA();
+
     tusb_init();
 
-    while (1)
-    {
+    while (true) {
         tud_task();
 
-        // USB READ, USB RX -> PIO TX
-        if (!pio_sm_is_tx_fifo_full(pio_instance, sm_readdata) && tud_cdc_n_available(0))
-        {
-            uint cdc_available = tud_cdc_n_available(0);
-            uint pio_fifo_space = 8 - pio_sm_get_tx_fifo_level(pio_instance, sm_readdata);
-            uint len = MIN(pio_fifo_space, cdc_available);
-            uint8_t datain[8];
-            uint count = tud_cdc_n_read(0, &datain, len);
-
-            for (uint i = 0; i < count; i++)
-            {
-                pio_instance->txf[sm_readdata] = datain[i];
-            }
-            update_status_register();
-        }
-
-        // USB WRITE, PIO RX -> USB TX
-        if (!pio_sm_is_rx_fifo_empty(pio_instance, sm_writedata))
-        {
-            uint len = pio_sm_get_rx_fifo_level(pio_instance, sm_writedata);
-            uint8_t dataout[len];
-            for (uint i = 0; i < len; i++)
-            {
-                dataout[i] = pio_instance->rxf[sm_writedata];
-            }
-
-            // Data gets discarded if the USB is not connected
-            if (tud_cdc_n_connected(0))
-            {
-                tud_cdc_n_write(0, &dataout, len);
-                tud_cdc_n_write_flush(0);
-            }
-            update_status_register();
-        }
+        usbRead();
+        usbWrite();
     }
 }
+static statusChannels initDMA(void) {
+    statusChannels channels;
 
-void cpu_fifo(void)
-{
-    sm_cpufifo = pio_claim_unused_sm(pio_instance, true);
-    sm_readdata = pio_claim_unused_sm(pio_instance, true);
-    sm_writedata = pio_claim_unused_sm(pio_instance, true);
+    channels.channelA = dma_claim_unused_channel(true);
+    channels.channelB = dma_claim_unused_channel(true);
 
-    uint offset_cpufifo = pio_add_program(pio_instance, &cpufifo_program);
-    uint offset_readdata = pio_add_program(pio_instance, &readdata_program);
-    uint offset_writedata = pio_add_program(pio_instance, &writedata_program);
+    dma_channel_config dmaConfig = {0};
 
-    init_cpufifo_program(pio_instance, sm_cpufifo, offset_cpufifo);
-    init_readdata_program(pio_instance, sm_readdata, offset_readdata);
-    init_writedata_program(pio_instance, sm_readdata, offset_writedata);
+    // Shared channel settings
+    channel_config_set_read_increment(&dmaConfig, false);
+    channel_config_set_write_increment(&dmaConfig, false);
+    channel_config_set_dreq(&dmaConfig, pio_get_dreq(s_pioInstance, s_smStatus, true));
+    channel_config_set_transfer_data_size(&dmaConfig, DMA_SIZE_8);
+    channel_config_set_ring(&dmaConfig, false, 0);
+    channel_config_set_bswap(&dmaConfig, false);
+    channel_config_set_irq_quiet(&dmaConfig, false);
+    channel_config_set_enable(&dmaConfig, true);
+    channel_config_set_sniff_enable(&dmaConfig, false);
+    channel_config_set_high_priority(&dmaConfig, false);
 
-    pio_status_irq = enable_irq(pio_instance, status_irq_handler, IRQ_UPDATESTATUS);
+    // Channel A
+    channel_config_set_chain_to(&dmaConfig, channels.channelB);
+    dma_channel_configure(channels.channelA, &dmaConfig, &s_pioInstance->txf[s_smStatus], &s_statusRegister, 1, false);
 
-    update_status_register();
+    // Channel B
+    channel_config_set_chain_to(&dmaConfig, channels.channelA);
+    dma_channel_configure(channels.channelB, &dmaConfig, &s_pioInstance->txf[s_smStatus], &s_statusRegister, 1, true);
 
-    while (true)
-    {
-        // sleep_ms(1000);
-    }
+    return channels;
 }
 
-static int8_t enable_irq(PIO pio, irq_handler_t handler, uint irq_num)
-{
-    irq_num %= 4;
-    int8_t pio_irq = (pio == pio0) ? PIO0_IRQ_0 : PIO1_IRQ_0;
-    enum pio_interrupt_source source = pis_interrupt0 + (irq_num);
+static void initGPIO(void) {
+    static const unsigned int controlPins[] = {
+        PIN_CS,
+        PIN_RD,
+        PIN_WR,
+        PIN_A0,
+    };
 
-    // Enable interrupt
-    if (irq_get_exclusive_handler(pio_irq))
-    {
-        pio_irq++;
-        if (irq_get_exclusive_handler(pio_irq))
-        {
-            panic("All IRQs are in use");
-        }
+    // Internal status data pins
+    for (unsigned int pin = STATUS_D0; pin <= STATUS_D7; pin++) {
+        pio_gpio_init(s_pioInstance, pin);
+        gpio_set_pulls(pin, true, true);
+        gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
     }
-
-    irq_set_exclusive_handler(pio_irq, handler);                                // Set the IRQ handler
-    irq_set_enabled(pio_irq, true);                                             // Enable the IRQ
-    const uint irq_index = pio_irq - ((pio == pio0) ? PIO0_IRQ_0 : PIO1_IRQ_0); // Get index of the IRQ
-    pio_set_irqn_source_enabled(pio, irq_index, source, true);                  // Set pio to tell us when source irq is raised
-    pio_interrupt_clear(pio, irq_num);
-
-    return pio_irq;
-}
-
-void init_cpufifo_program(PIO pio, uint sm, uint offset)
-{
-    pio_sm_config c = cpufifo_program_get_default_config(offset);
-    // Setup data pins and data out state machine
-    static const uint pin_count = rd_pin - base_data_pin;
 
     // Data pins
-    for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
-    {
-        pio_gpio_init(pio, pin);
+    for (unsigned int pin = PIN_D0; pin <= PIN_D7; pin++) {
+        pio_gpio_init(s_pioInstance, pin);
         gpio_set_pulls(pin, false, false);
-        gpio_set_input_enabled(pin, false);
+        gpio_set_input_enabled(pin, true);
         gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
         gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_4MA);
     }
 
-    // CS + Addr + RD pins
-    for (uint pin = cs_pin; pin <= rd_pin; pin++)
-    {
-        pio_gpio_init(pio, pin);
-        gpio_set_pulls(pin, false, false);
-        gpio_set_input_enabled(pin, true);
+    // Control pins
+    for (unsigned int pin = 0; pin < (sizeof(controlPins) / sizeof(controlPins[0])); pin++) {
+        pio_gpio_init(s_pioInstance, controlPins[pin]);
+        gpio_set_pulls(controlPins[pin], false, false);
+        gpio_set_input_enabled(controlPins[pin], true);
+        gpio_set_slew_rate(controlPins[pin], GPIO_SLEW_RATE_FAST);
     }
-
-    pio_sm_set_consecutive_pindirs(pio, sm, base_data_pin, pin_count, false);
-
-    sm_config_set_in_pins(&c, base_data_pin);
-    sm_config_set_out_pins(&c, base_data_pin, 8);
-    sm_config_set_jmp_pin(&c, rd_pin);
-    sm_config_set_out_shift(&c, true, false, 8);
-
-    pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
 }
 
-void init_readdata_program(PIO pio, uint sm, uint offset)
-{
-    static const uint base_data_pin = 2;
+static programOffsets initPIO(void) {
+    programOffsets offsets;
 
+    offsets.readProgramOffset = pio_add_program(s_pioInstance, &readdata_program);
+    offsets.statusProgramOffset = pio_add_program(s_pioInstance, &statusreg_program);
+    offsets.writeProgramOffset = pio_add_program(s_pioInstance, &writedata_program);
+
+    initProgramRead(s_pioInstance, s_smRead, offsets.readProgramOffset);
+    initProgramStatus(s_pioInstance, s_smStatus, offsets.statusProgramOffset);
+    initProgramWrite(s_pioInstance, s_smWrite, offsets.writeProgramOffset);
+
+    return offsets;
+}
+
+static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset) {
     pio_sm_config c = readdata_program_get_default_config(offset);
 
-    // Data pins
-    for (uint pin = base_data_pin; pin < base_data_pin + 8; pin++)
-    {
-        pio_gpio_init(pio, pin);
-        gpio_set_input_enabled(pin, false);
-    }
-
-    pio_sm_set_consecutive_pindirs(pio, sm, base_data_pin, 8, false);
-    sm_config_set_out_pins(&c, base_data_pin, 8);
+    sm_config_set_out_pins(&c, PIN_D0, 8);
     sm_config_set_out_shift(&c, true, false, 8);
+
+    sm_config_set_in_pins(&c, PIN_A0);
+    sm_config_set_in_shift(&c, true, false, 0);
+    sm_config_set_jmp_pin(&c, PIN_RD);
+
+    sm_config_set_set_pins(&c, PIN_D0, 5);         // Set pin D0 to D5 for the set(pindirs) instruction
+    sm_config_set_sideset(&c, 3 + 1, true, true);  // 3 bits sideset + 1 bit for SIDE_EN(optional sideset)
+    sm_config_set_sideset_pin_base(&c, PIN_D5);    // Set the base pin for the sideset to D5
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
 
-void init_writedata_program(PIO pio, uint sm, uint offset)
-{
-    // Setup WR state machine
-    pio_sm_set_consecutive_pindirs(pio, sm_writedata, base_data_pin, cs_pin - base_data_pin, false);
-    pio_gpio_init(pio, cs_pin);
-    pio_gpio_init(pio, wr_pin);
-    gpio_set_pulls(cs_pin, false, false);
-    gpio_set_pulls(wr_pin, false, false);
-    gpio_set_input_enabled(cs_pin, true);
-    gpio_set_input_enabled(wr_pin, true);
+static void initProgramStatus(const PIO pio, const unsigned int sm, const unsigned int offset) {
+    pio_sm_config c = statusreg_program_get_default_config(offset);
 
-    uint offset_writedata = pio_add_program(pio, &writedata_program);
-    pio_sm_config c = writedata_program_get_default_config(offset_writedata);
+    pio_sm_set_consecutive_pindirs(pio, sm, STATUS_D0, 8, true);
+    sm_config_set_out_pins(&c, STATUS_D0, 8);
+    sm_config_set_out_shift(&c, true, true, 8);
 
-    for (uint pin = base_data_pin; pin <= wr_pin; pin++)
-    {
-        pio_gpio_init(pio, pin);
-        gpio_set_input_enabled(pin, true);
-    }
-    sm_config_set_in_pins(&c, base_data_pin);
-    sm_config_set_jmp_pin(&c, wr_pin);
-    sm_config_set_in_shift(&c, false, false, 8);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset) {
+    pio_sm_config c = writedata_program_get_default_config(offset);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_D0, 8, false);  // Set the pin direction to input
+    sm_config_set_in_pins(&c, PIN_D0);
+    // sm_config_set_in_pin_count(&c, 8);  // Set the number of input pins to 8
+    //(RP2040 cannot mask input pins, so in_count is ignored and set to 32 here)
+    sm_config_set_jmp_pin(&c, PIN_WR);
+    sm_config_set_in_shift(&c, false, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 
-    pio_sm_init(pio, sm_writedata, offset_writedata, &c);
-    pio_sm_set_enabled(pio, sm_writedata, true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
 }
 
-static void status_irq_handler(void)
-{
-    update_status_register();
-    pio_interrupt_clear(pio_instance, IRQ_UPDATESTATUS);
+static inline void updateStatusRegister(void) {
+    // Status register format:
+    // Bit 0: Data Available (RXF)
+    // Bit 1: Space Available (TXE)
+    // Bit 2: Suspend(Not implemented, always 0)
+    // Bit 3: Configured
+
+    static const bool deviceConfigured = true;
+    const uint32_t notFstat = ~s_pioInstance->fstat;
+    const bool dataAvailable = (notFstat & (1u << (PIO_FSTAT_TXEMPTY_LSB + s_smRead)));
+    const bool spaceAvailable = (notFstat & (1u << (PIO_FSTAT_RXFULL_LSB + s_smWrite)));
+
+    s_statusRegister = ((deviceConfigured << 3u) | (spaceAvailable << 1u) | (dataAvailable << 0u));
 }
 
-static inline void update_status_register(void)
-{
-    if (pio_sm_is_tx_fifo_empty(pio_instance, sm_readdata))
-    {
-        statusreg &= ~FT_STATUS_DATA_AVAILABLE;
-    }
-    else
-    {
-        statusreg |= FT_STATUS_DATA_AVAILABLE;
-    }
+static inline void usbRead(void) {
+    static uint8_t buffer[8];
+    // USB READ, USB RX -> PIO TX
+    if (tud_cdc_n_available(0)) {
+        if (!pio_sm_is_tx_fifo_full(s_pioInstance, s_smRead)) {
+            const unsigned int len = 8 - pio_sm_get_tx_fifo_level(s_pioInstance, s_smRead);
+            const unsigned int count = tud_cdc_n_read(0, buffer, len);
 
-    if (pio_sm_is_rx_fifo_full(pio_instance, sm_writedata))
-    {
-        statusreg &= ~FT_STATUS_SPACE_AVAILABLE;
+            for (unsigned int i = 0; i < count; i++) {
+                pio_sm_put(s_pioInstance, s_smRead, buffer[i]);
+            }
+        }
     }
-    else
-    {
-        statusreg |= FT_STATUS_SPACE_AVAILABLE;
-    }
+}
 
-    pio_sm_drain_tx_fifo(pio_instance, sm_cpufifo);
-    pio_instance->txf[sm_cpufifo] = statusreg;
+static inline void usbWrite(void) {
+    static uint8_t buffer[8];
+    // USB WRITE, PIO RX -> USB TX
+    if (!pio_sm_is_rx_fifo_empty(s_pioInstance, s_smWrite)) {
+        unsigned int len = pio_sm_get_rx_fifo_level(s_pioInstance, s_smWrite);
+        len = MIN(len, tud_cdc_n_write_available(0));
+
+        if (len) {
+            for (unsigned int i = 0; i < len; i++) {
+                buffer[i] = pio_sm_get(s_pioInstance, s_smWrite);
+            }
+
+            // Data gets discarded if the USB is not connected
+            if (tud_cdc_n_connected(0)) {
+                tud_cdc_n_write(0, buffer, len);
+                tud_cdc_n_write_flush(0);
+            }
+        }
+    }
 }
