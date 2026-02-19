@@ -26,28 +26,36 @@ typedef struct {
 } statusChannels;
 
 enum Pin {
-    PIN_CS = 1u,
-    PIN_D0 = 3u,
-    PIN_D1 = 4u,
-    PIN_D2 = 5u,
-    PIN_D3 = 6u,
-    PIN_D4 = 7u,
-    PIN_D5 = 8u,
-    PIN_D6 = 9u,
-    PIN_D7 = 10u,
-    PIN_RD = 12u,
-    PIN_WR = 13u,
-    PIN_A0 = 14u,
+    PIN_D0 = 0u,
+    PIN_D1 = 1u,
+    PIN_D2 = 2u,
+    PIN_D3 = 3u,
+    PIN_D4 = 4u,
+    PIN_D5 = 5u,
+    PIN_D6 = 6u,
+    PIN_D7 = 7u,
+    PIN_D8 = 8u,
+    PIN_D9 = 9u,
+    PIN_D10 = 10u,
+    PIN_D11 = 11u,
+    PIN_D12 = 12u,
+    PIN_D13 = 13u,
+    PIN_D14 = 14u,
+    PIN_D15 = 15u,
+    PIN_CS = 16u,
+    PIN_RD = 17u,
+    PIN_WR = 18u,
+    PIN_A0 = 19u,
     // The pins below are not physical connections
     // These are used for internal purposes only
-    STATUS_D0 = 17u,
-    STATUS_D1 = 18u,
-    STATUS_D2 = 19u,
-    STATUS_D3 = 20u,
-    STATUS_D4 = 21u,
-    STATUS_D5 = 22u,
-    STATUS_D6 = 23u,
-    STATUS_D7 = 24u,
+    STATUS_D0 = 20u,
+    STATUS_D1 = 21u,
+    STATUS_D2 = 22u,
+    STATUS_D3 = 23u,
+    //STATUS_D4 = 27u,
+    //STATUS_D5 = 28u,
+    //STATUS_D6 = 29u,
+    //STATUS_D7 = 30u,
 };
 
 static volatile unsigned int s_statusRegister = 0x0a;
@@ -133,7 +141,7 @@ static void initGPIO(void) {
     };
 
     // Internal status data pins
-    for (unsigned int pin = STATUS_D0; pin <= STATUS_D7; pin++) {
+    for (unsigned int pin = STATUS_D0; pin <= STATUS_D3; pin++) {
         pio_gpio_init(s_pioInstance, pin);
         gpio_set_pulls(pin, true, true);
         gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);

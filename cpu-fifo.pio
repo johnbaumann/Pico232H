@@ -1,6 +1,6 @@
-.define GPIO_CS     1
-.define GPIO_RD     12
-.define GPIO_WR     13
+.define GPIO_CS     16
+.define GPIO_RD     17
+.define GPIO_WR     18
 
 
 ; Output data to pins from TX FIFO
@@ -17,8 +17,8 @@ idle:
     jmp !y sendData                 ; Send status if address pin is low, otherwise send data
 
 ;sendStatus:
-    in pins 11                      ; Read up to status pins
-    in null, 24                     ; Shift out everything but the status pins
+    in pins 5                       ; Read up to status pins
+    in null, 28                     ; Shift out everything but the status pins
     mov pins, isr                   ; Finally, copy the value to the output pins
     jmp outputWait
 
