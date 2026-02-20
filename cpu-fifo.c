@@ -259,15 +259,17 @@ static inline void updateStatusRegister(void) {
 }
 
 static inline void usbRead(void) {
-    static uint8_t buffer[8];
+    static uint8_t buffer[16];
     // USB READ, USB RX -> PIO TX
-    if (tud_cdc_n_available(0)) {
+    const unsigned int available = tud_cdc_n_available(0);
+    if (available && (available % 2) == 0) {
         if (!pio_sm_is_tx_fifo_full(s_pioInstanceLo, s_smReadLo)) {
             const unsigned int len = 8 - pio_sm_get_tx_fifo_level(s_pioInstanceLo, s_smReadLo);
-            const unsigned int count = tud_cdc_n_read(0, buffer, len);
+            const unsigned int count = tud_cdc_n_read(0, buffer, len*2);
 
-            for (unsigned int i = 0; i < count; i++) {
+            for (unsigned int i = 0; i < count; i+=2) {
                 pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i]);
+                pio_sm_put(s_pioInstanceHi, s_smReadHi, buffer[i+1]);
             }
         }
     }
