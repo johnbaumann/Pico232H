@@ -15,9 +15,11 @@
 #include "cpu-fifo.pio.h"
 
 typedef struct {
-    int readProgramOffset;
+    int readProgramLoOffset;
+    int readProgramHiOffset;
+    int writeProgramLoOffset;
+    int writeProgramHiOffset;
     int statusProgramOffset;
-    int writeProgramOffset;
 } programOffsets;
 
 typedef struct {
@@ -52,26 +54,28 @@ enum Pin {
     STATUS_D1 = 21u,
     STATUS_D2 = 22u,
     STATUS_D3 = 23u,
-    //STATUS_D4 = 27u,
-    //STATUS_D5 = 28u,
-    //STATUS_D6 = 29u,
-    //STATUS_D7 = 30u,
 };
 
 static volatile unsigned int s_statusRegister = 0x0a;
 
-static const PIO s_pioInstance = pio0;
-static const unsigned int s_smRead = 0;
+static const PIO s_pioInstanceLo = pio0;
+static const unsigned int s_smReadLo = 0;
 static const unsigned int s_smStatus = 1;
-static const unsigned int s_smWrite = 2;
+static const unsigned int s_smWriteLo = 2;
+
+static const PIO s_pioInstanceHi = pio1;
+static const unsigned int s_smReadHi = 0;
+static const unsigned int s_smWriteHi = 1;
 
 static void core1_entry(void);
 static statusChannels initDMA(void);
 static void initGPIO(void);
 static programOffsets initPIO(void);
-static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset);
+static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset,
+                            const unsigned int dataPinBase);
 static void initProgramStatus(const PIO pio, const unsigned int sm, const unsigned int offset);
-static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset);
+static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset,
+                             const unsigned int dataPinBase);
 static void statusIRQHandler(void);
 static void updateStatusRegister(void);
 static void usbRead(void);
@@ -112,7 +116,7 @@ static statusChannels initDMA(void) {
     // Shared channel settings
     channel_config_set_read_increment(&dmaConfig, false);
     channel_config_set_write_increment(&dmaConfig, false);
-    channel_config_set_dreq(&dmaConfig, pio_get_dreq(s_pioInstance, s_smStatus, true));
+    channel_config_set_dreq(&dmaConfig, pio_get_dreq(s_pioInstanceLo, s_smStatus, true));
     channel_config_set_transfer_data_size(&dmaConfig, DMA_SIZE_8);
     channel_config_set_ring(&dmaConfig, false, 0);
     channel_config_set_bswap(&dmaConfig, false);
@@ -123,11 +127,12 @@ static statusChannels initDMA(void) {
 
     // Channel A
     channel_config_set_chain_to(&dmaConfig, channels.channelB);
-    dma_channel_configure(channels.channelA, &dmaConfig, &s_pioInstance->txf[s_smStatus], &s_statusRegister, 1, false);
+    dma_channel_configure(channels.channelA, &dmaConfig, &s_pioInstanceLo->txf[s_smStatus], &s_statusRegister, 1,
+                          false);
 
     // Channel B
     channel_config_set_chain_to(&dmaConfig, channels.channelA);
-    dma_channel_configure(channels.channelB, &dmaConfig, &s_pioInstance->txf[s_smStatus], &s_statusRegister, 1, true);
+    dma_channel_configure(channels.channelB, &dmaConfig, &s_pioInstanceLo->txf[s_smStatus], &s_statusRegister, 1, true);
 
     return channels;
 }
@@ -142,14 +147,23 @@ static void initGPIO(void) {
 
     // Internal status data pins
     for (unsigned int pin = STATUS_D0; pin <= STATUS_D3; pin++) {
-        pio_gpio_init(s_pioInstance, pin);
+        pio_gpio_init(s_pioInstanceLo, pin);
         gpio_set_pulls(pin, true, true);
         gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
     }
 
-    // Data pins
+    // Data pins - Lo
     for (unsigned int pin = PIN_D0; pin <= PIN_D7; pin++) {
-        pio_gpio_init(s_pioInstance, pin);
+        pio_gpio_init(s_pioInstanceLo, pin);
+        gpio_set_pulls(pin, false, false);
+        gpio_set_input_enabled(pin, true);
+        gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
+        gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_4MA);
+    }
+
+    // Data pins - Hi
+    for (unsigned int pin = PIN_D8; pin <= PIN_D15; pin++) {
+        pio_gpio_init(s_pioInstanceHi, pin);
         gpio_set_pulls(pin, false, false);
         gpio_set_input_enabled(pin, true);
         gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
@@ -158,7 +172,7 @@ static void initGPIO(void) {
 
     // Control pins
     for (unsigned int pin = 0; pin < (sizeof(controlPins) / sizeof(controlPins[0])); pin++) {
-        pio_gpio_init(s_pioInstance, controlPins[pin]);
+        gpio_init(controlPins[pin]);
         gpio_set_pulls(controlPins[pin], false, false);
         gpio_set_input_enabled(controlPins[pin], true);
         gpio_set_slew_rate(controlPins[pin], GPIO_SLEW_RATE_FAST);
@@ -168,30 +182,36 @@ static void initGPIO(void) {
 static programOffsets initPIO(void) {
     programOffsets offsets;
 
-    offsets.readProgramOffset = pio_add_program(s_pioInstance, &readdata_program);
-    offsets.statusProgramOffset = pio_add_program(s_pioInstance, &statusreg_program);
-    offsets.writeProgramOffset = pio_add_program(s_pioInstance, &writedata_program);
+    offsets.statusProgramOffset = pio_add_program(s_pioInstanceLo, &statusreg_program);
+    initProgramStatus(s_pioInstanceLo, s_smStatus, offsets.statusProgramOffset);
 
-    initProgramRead(s_pioInstance, s_smRead, offsets.readProgramOffset);
-    initProgramStatus(s_pioInstance, s_smStatus, offsets.statusProgramOffset);
-    initProgramWrite(s_pioInstance, s_smWrite, offsets.writeProgramOffset);
+    offsets.readProgramLoOffset = pio_add_program(s_pioInstanceLo, &readdata_program);
+    offsets.readProgramHiOffset = pio_add_program(s_pioInstanceHi, &readdata_program);
+    initProgramRead(s_pioInstanceLo, s_smReadLo, offsets.readProgramLoOffset, PIN_D0);
+    initProgramRead(s_pioInstanceHi, s_smReadHi, offsets.readProgramHiOffset, PIN_D8);
+
+    offsets.writeProgramLoOffset = pio_add_program(s_pioInstanceLo, &writedata_program);
+    offsets.writeProgramHiOffset = pio_add_program(s_pioInstanceHi, &writedata_program);
+    initProgramWrite(s_pioInstanceLo, s_smWriteLo, offsets.writeProgramLoOffset, PIN_D0);
+    initProgramWrite(s_pioInstanceHi, s_smWriteHi, offsets.writeProgramHiOffset, PIN_D8);
 
     return offsets;
 }
 
-static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset) {
+static void initProgramRead(const PIO pio, const unsigned int sm, const unsigned int offset,
+                            const unsigned int dataPinBase) {
     pio_sm_config c = readdata_program_get_default_config(offset);
 
-    sm_config_set_out_pins(&c, PIN_D0, 8);
+    sm_config_set_out_pins(&c, dataPinBase, 8);
     sm_config_set_out_shift(&c, true, false, 8);
 
     sm_config_set_in_pins(&c, PIN_A0);
     sm_config_set_in_shift(&c, true, false, 0);
     sm_config_set_jmp_pin(&c, PIN_RD);
 
-    sm_config_set_set_pins(&c, PIN_D0, 5);         // Set pin D0 to D5 for the set(pindirs) instruction
-    sm_config_set_sideset(&c, 3 + 1, true, true);  // 3 bits sideset + 1 bit for SIDE_EN(optional sideset)
-    sm_config_set_sideset_pin_base(&c, PIN_D5);    // Set the base pin for the sideset to D5
+    sm_config_set_set_pins(&c, dataPinBase, 5);           // Set pin D0 to D5 for the set(pindirs) instruction
+    sm_config_set_sideset(&c, 3 + 1, true, true);         // 3 bits sideset + 1 bit for SIDE_EN(optional sideset)
+    sm_config_set_sideset_pin_base(&c, dataPinBase + 5);  // Set the base pin for the sideset to 5th bit
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 
     pio_sm_init(pio, sm, offset, &c);
@@ -209,13 +229,12 @@ static void initProgramStatus(const PIO pio, const unsigned int sm, const unsign
     pio_sm_set_enabled(pio, sm, true);
 }
 
-static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset) {
+static void initProgramWrite(const PIO pio, const unsigned int sm, const unsigned int offset,
+                             const unsigned int dataPinBase) {
     pio_sm_config c = writedata_program_get_default_config(offset);
 
-    pio_sm_set_consecutive_pindirs(pio, sm, PIN_D0, 8, false);  // Set the pin direction to input
-    sm_config_set_in_pins(&c, PIN_D0);
-    // sm_config_set_in_pin_count(&c, 8);  // Set the number of input pins to 8
-    //(RP2040 cannot mask input pins, so in_count is ignored and set to 32 here)
+    pio_sm_set_consecutive_pindirs(pio, sm, dataPinBase, 8, false);  // Set the pin direction to input
+    sm_config_set_in_pins(&c, dataPinBase);
     sm_config_set_jmp_pin(&c, PIN_WR);
     sm_config_set_in_shift(&c, false, true, 8);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
@@ -232,9 +251,9 @@ static inline void updateStatusRegister(void) {
     // Bit 3: Configured
 
     static const bool deviceConfigured = true;
-    const uint32_t notFstat = ~s_pioInstance->fstat;
-    const bool dataAvailable = (notFstat & (1u << (PIO_FSTAT_TXEMPTY_LSB + s_smRead)));
-    const bool spaceAvailable = (notFstat & (1u << (PIO_FSTAT_RXFULL_LSB + s_smWrite)));
+    const uint32_t notFstat = ~s_pioInstanceLo->fstat;
+    const bool dataAvailable = (notFstat & (1u << (PIO_FSTAT_TXEMPTY_LSB + s_smReadLo)));
+    const bool spaceAvailable = (notFstat & (1u << (PIO_FSTAT_RXFULL_LSB + s_smWriteLo)));
 
     s_statusRegister = ((deviceConfigured << 3u) | (spaceAvailable << 1u) | (dataAvailable << 0u));
 }
@@ -243,27 +262,28 @@ static inline void usbRead(void) {
     static uint8_t buffer[8];
     // USB READ, USB RX -> PIO TX
     if (tud_cdc_n_available(0)) {
-        if (!pio_sm_is_tx_fifo_full(s_pioInstance, s_smRead)) {
-            const unsigned int len = 8 - pio_sm_get_tx_fifo_level(s_pioInstance, s_smRead);
+        if (!pio_sm_is_tx_fifo_full(s_pioInstanceLo, s_smReadLo)) {
+            const unsigned int len = 8 - pio_sm_get_tx_fifo_level(s_pioInstanceLo, s_smReadLo);
             const unsigned int count = tud_cdc_n_read(0, buffer, len);
 
             for (unsigned int i = 0; i < count; i++) {
-                pio_sm_put(s_pioInstance, s_smRead, buffer[i]);
+                pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i]);
             }
         }
     }
 }
 
 static inline void usbWrite(void) {
-    static uint8_t buffer[8];
+    static uint8_t buffer[16];
     // USB WRITE, PIO RX -> USB TX
-    if (!pio_sm_is_rx_fifo_empty(s_pioInstance, s_smWrite)) {
-        unsigned int len = pio_sm_get_rx_fifo_level(s_pioInstance, s_smWrite);
+    if (!pio_sm_is_rx_fifo_empty(s_pioInstanceLo, s_smWriteLo)) {
+        unsigned int len = pio_sm_get_rx_fifo_level(s_pioInstanceLo, s_smWriteLo) * 2;
         len = MIN(len, tud_cdc_n_write_available(0));
 
         if (len) {
-            for (unsigned int i = 0; i < len; i++) {
-                buffer[i] = pio_sm_get(s_pioInstance, s_smWrite);
+            for (unsigned int i = 0; i < len; i+=2) {
+                buffer[i] = pio_sm_get(s_pioInstanceHi, s_smWriteHi);
+                buffer[i+1] = pio_sm_get(s_pioInstanceLo, s_smWriteLo);
             }
 
             // Data gets discarded if the USB is not connected
