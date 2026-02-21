@@ -268,8 +268,8 @@ static inline void usbRead(void) {
             const unsigned int count = tud_cdc_n_read(0, buffer, len*2);
 
             for (unsigned int i = 0; i < count; i+=2) {
-                pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i]);
-                pio_sm_put(s_pioInstanceHi, s_smReadHi, buffer[i+1]);
+                pio_sm_put(s_pioInstanceHi, s_smReadHi, buffer[i]);
+                pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i+1]);
             }
         }
     }
