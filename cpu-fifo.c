@@ -261,15 +261,19 @@ static inline void updateStatusRegister(void) {
 static inline void usbRead(void) {
     static uint8_t buffer[16];
     // USB READ, USB RX -> PIO TX
-    const unsigned int available = tud_cdc_n_available(0);
-    if (available && (available % 2) == 0) {
+    unsigned int available = tud_cdc_n_available(0);
+    if (available & 1) {
+        available--;
+    }
+
+    if (available) {
         if (!pio_sm_is_tx_fifo_full(s_pioInstanceLo, s_smReadLo)) {
             const unsigned int len = 8 - pio_sm_get_tx_fifo_level(s_pioInstanceLo, s_smReadLo);
-            const unsigned int count = tud_cdc_n_read(0, buffer, len*2);
+            const unsigned int count = tud_cdc_n_read(0, buffer, MIN(len * 2, available));
 
-            for (unsigned int i = 0; i < count; i+=2) {
+            for (unsigned int i = 0; i < count; i += 2) {
                 pio_sm_put(s_pioInstanceHi, s_smReadHi, buffer[i]);
-                pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i+1]);
+                pio_sm_put(s_pioInstanceLo, s_smReadLo, buffer[i + 1]);
             }
         }
     }
@@ -283,9 +287,9 @@ static inline void usbWrite(void) {
         len = MIN(len, tud_cdc_n_write_available(0));
 
         if (len) {
-            for (unsigned int i = 0; i < len; i+=2) {
+            for (unsigned int i = 0; i < len; i += 2) {
                 buffer[i] = pio_sm_get(s_pioInstanceHi, s_smWriteHi);
-                buffer[i+1] = pio_sm_get(s_pioInstanceLo, s_smWriteLo);
+                buffer[i + 1] = pio_sm_get(s_pioInstanceLo, s_smWriteLo);
             }
 
             // Data gets discarded if the USB is not connected
